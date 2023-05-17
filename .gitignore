@@ -1,0 +1,10 @@
+._.DS_Store
+.snakemake/
+README_fmt_gtf
+benchmarks/
+data/
+results/
+slurm-*
+slurm/
+snakemake.log
+.DS_Store
