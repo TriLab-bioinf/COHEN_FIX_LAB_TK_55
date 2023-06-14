@@ -1,0 +1,683 @@
+---
+title: "Differential gene expression with replicates"
+author: "Amanda Yeo, Hernan Lorenzi, Orna Cohen-Fix"
+date: "2023-06-06"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(message = FALSE, 
+                      warning = FALSE,
+                      tidy.opts=list(width.cutoff=80),
+                      tidy=TRUE
+                      )
+```
+
+### Install required packages
+
+```{r}
+### Install required R libraries/packages:
+
+# CRAN repository:
+required_cran_packages <- c("cowplot","ggpubr","ggsci","RColorBrewer","pheatmap")
+new_cran_packages <- required_cran_packages[!(required_cran_packages %in%
+                                                installed.packages()[,"Package"])]
+if(length(new_cran_packages)>0) {install.packages(new_cran_packages)}
+
+# Bioconductor repository:
+required_bioconductor_packages <- c("DESeq2","org.Sc.sgd.db","EnhancedVolcano")
+
+new_bioconductor_packages <- required_bioconductor_packages[!(required_bioconductor_packages %in%
+                                                installed.packages()[,"Package"])]
+
+if(length(new_bioconductor_packages)>0) {
+  if (!require("BiocManager", quietly = TRUE)){
+    install.packages("BiocManager")
+  }
+  BiocManager::install(new_bioconductor_packages)
+}
+```
+
+### Load R libraries
+
+```{r}
+# Packages for differential expression analysis and plotting:
+
+suppressWarnings(
+  suppressPackageStartupMessages({
+    library(DESeq2);  # Package for differential expression analysis
+    library(cowplot); # Package for saving plots (ggsave2)
+    library(ggpubr); # Package for plotting functions
+    library(ggsci);
+    library(RColorBrewer); 
+    library(pheatmap); # Package for volcane plot functions
+    library(org.Sc.sgd.db); # Yeast annotations
+    library(EnhancedVolcano);
+    }
+  )
+)
+# Packages for functional analysis:
+
+#library(clusterProfiler)
+#library(enrichplot)
+#library(ggupset)
+#library(msigdbr)
+#library(ReactomePA)
+#library(ggraph)
+#library(BSgenome)
+```
+
+### Load useful functions
+
+```{r}
+#
+# --- function for adding gene names to DESeq2 result table ---
+#
+get_gene_names_from_gene_ids <- function(ensemble_ids, annotation_db, 
+                                         look_for = 'ENSEMBL', 
+                                         fetch = 'GENENAME'){
+  # Reference organism: Saccharomyces cerevisiae => DATABASE = org.Sc.sgd.db
+  symbols <- mapIds(annotation_db, keys = ensemble_ids, column = fetch, 
+                    keytype = look_for)
+  symbols <- symbols[!is.na(symbols)]
+  to_name <- ensemble_ids %in% names(symbols)
+  ensemble_ids[to_name] <- as.vector(symbols)
+  return(ensemble_ids)
+}
+#
+# --- function for PCA plots ---
+#
+plot_PCA = function(object, color_by="condition", 
+                    shape_by = 19, ntop=500, 
+                    returnData=FALSE, pcs = c(1,2))
+{
+  # Check variables are present in object
+  intgroup = c(color_by)
+  if (shape_by != 19){intgroup <- c(intgroup, shape_by)}
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+
+  # calculate the variance for each gene
+  rv <- rowVars(assay(object))
+
+  # select the ntop genes by variance
+  select <- order(rv, decreasing=TRUE)[seq_len(min(ntop, length(rv)))]
+
+  # perform a PCA on the data in assay(x) for the selected genes
+  pca <- prcomp(t(assay(object)[select,]))
+
+  # the contribution to the total variance for each component
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )
+
+  
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pcs[1]], PC2=pca$x[,pcs[2]], group=group, intgroup.df, name=colnames(object))
+  colnames(d)[1] <- paste0("PC",pcs[1])
+  colnames(d)[2] <- paste0("PC",pcs[2])
+  
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  
+  ggplot(data=d, aes_string(x=colnames(d)[1], y=colnames(d)[2], color=color_by, shape=shape_by)) + 
+    geom_point(size=3) + 
+    scale_color_lancet() +
+    xlab(paste0("PC",pcs[1],": ",round(percentVar[1] * 100),"% variance")) +
+    ylab(paste0("PC",pcs[2],": ",round(percentVar[2] * 100),"% variance")) +
+    coord_fixed(ratio = (max(d[,1])-min(d[,1]))/(max(d[,2])-min(d[,2])))
+}
+
+#
+# --- function to plot gene expression of top10 genes ---
+#
+# Plot top10 diff expressed genes
+plot_expression_topN_genes <- function(deseq_result, N=10){
+  my_top10 <- head(rownames(deseq_result),N)
+  for (gene in my_top10){
+    print(gene)
+    plotCounts(dds, gene, 
+               intgroup = c("treatment","genotype"), 
+               returnData = FALSE, col=metadata$genotype)
+  }
+}
+```
+
+### Load data
+
+```{r}
+# Import read counts table into read_counts variable
+read_counts <- read.table(file = "./data/read_counts_table_withduplicates_FIXED.txt",  
+                          header = TRUE, # First line contains column headers 
+                          row.names = 1, # Column 1 contains row names
+                          sep = "\t")   # Column delimiter is a tab (\t)
+
+# Round read counts to the closest integer
+read_counts <- round(read_counts, digits = 0)
+
+# Read metadata table
+metadata <- read.table(file = "./data/metadata_OC8345_FIXED.txt", 
+                       header = TRUE, 
+                       row.names = 1,
+                       sep = "\t")
+
+# Sort read_counts table so metadata and read_counts match order
+if(!unique(colnames(read_counts) == rownames(metadata))){
+  read_counts <- read_counts[, match(rownames(metadata), colnames(read_counts))]
+}
+
+# Include sample ids in metadata as a variable (column)
+metadata$sample_id <- c("AY1", "AY2", "AY3", "AY4","AY5", "AY6", "AY7", "AY8", "AY9", "AY10" , "AY11" , "AY12")
+
+# Include total read counts in metadata
+metadata$read_counts <- colSums(read_counts, na.rm = TRUE)
+
+# Make group, strain, treatment and genotype columns as factors
+metadata$treatment <- as.factor(metadata$treatment)
+metadata$strain <- as.factor(metadata$strain)
+metadata$genotype <- as.factor(metadata$genotype)
+
+```
+
+### DE analysis with DESeq2
+
+```{r}
+# Create folder for storing plots
+dir.create(path = "./Plots", showWarnings = FALSE)
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = read_counts,
+                              colData = metadata,
+                              design = ~ genotype + treatment) # Here we assume that all genotypes respond the same to treatment
+
+# Make sure reference groups are "none" and "wt". This means those categories will be the denominator when calculating Log2FC.
+dds$treatment <- relevel(dds$treatment, "none")
+dds$genotype <- relevel(dds$genotype, "wt")
+dds <- DESeq(dds)
+```
+
+### Explortory analysis #1
+
+```{r}
+# Plot total reads per sample using barchar
+readcounts.p <- ggbarplot(data = metadata,
+                x = "sample_id",
+                y = "read_counts",
+                x.text.angle = 90,
+                fill = "treatment",
+                title = "Total read counts per sample",
+                ylab = "Read counts",
+                sort.by.groups = TRUE,
+                palette = c("red","orange"), #"jco",
+                sort.val = "asc") + xlab("Sample") + ylab("Read counts")
+ggsave2("Plots/barplot_read_counts_per_sample_AMANDA.pdf", plot = readcounts.p)
+
+print(readcounts.p)
+```
+
+**Figure 1:** Number of reads per sample
+
+### Preprocess data stored in DESeq2 object dds
+
+```{r}
+# 1. Normalize counts
+dds.vst <- vst(dds, blind=TRUE)
+
+# 2. Keep genes with at least 10 reads total across all samples
+keep <- rowSums(as.data.frame(dds.vst@assays@data@listData)) >= 10
+dds.vst <- dds.vst[keep,]
+
+# 3. Calculate distances between samples
+sampleDists <- dist(t(assay(dds.vst)))
+
+# 4. Plot inter-sample distances
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rownames(sampleDistMatrix), dds.vst$treatment)
+
+#colnames(sampleDistMatrix) <- NULL
+hm.p <- pheatmap(mat = sampleDistMatrix,
+                clustering_distance_rows=sampleDists,
+                clustering_distance_cols=sampleDists,
+                labels_row = paste(metadata$treatment, 
+                                   metadata$genotype, sep = "-"),
+                labels_col = metadata$sample_id
+                )
+
+ggsave2(filename = "./Plots/heat_map_AMANDA.pdf", plot = hm.p)
+
+print(hm.p)
+
+```
+
+**Figure 2:** For wt and kar4 samples cluster by treatment separated for the rest of samples. Ste12 samples also cluster by tratment but their response seems to be different. This suggests that there is an interction effect between genotype and treatment.
+
+### PCA
+
+```{r}
+# PCA
+principal_components <- c(1,2)
+pca.p <- plot_PCA(object = dds.vst, ntop = 500,
+                    color_by = "treatment", 
+                    shape_by = "genotype",
+                    pcs = principal_components,
+                    returnData = FALSE)
+
+ggsave(paste0("Plots/pca_by_group_PC",principal_components[1],principal_components[2],"_AMANDA.pdf"), plot = pca.p)
+print(pca.p)
+```
+
+**Figure 3:** Samples group mainly by alpha factor treatment, but is seems there is an interaction effect of the genotype and tratment.
+
+### Print DESeq2 coefficients
+
+```{r}
+print(resultsNames(dds))
+```
+
+### Differential expression analysis:
+
+**1.A- The effect of treatment across all samples (the main effect) controlling for genotype and assumming that there is no interaction effect (all genotypes respond to the treatment similarly).**
+
+*Note: For additional information about different ways of extracting results from a DESeq object see results() function help by typing ?results in the console,*
+
+```{r, warning=FALSE}
+# Create results directory where to store result tables
+dir.create("./Results", showWarnings = FALSE)
+
+DE_results_list <- list()
+
+coef <- c("treatment_alpha_factor_vs_none")
+
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- "example_1.A"
+
+# Get DESeq2 results. Note that when using coefficient names, you have to convert the coef vetor to a list by doing list(c(coef))
+DE_results <- results(dds, contrast=list(c(coef)))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Add gene names to results table
+DE_results$gene_names <- get_gene_names_from_gene_ids(ensemble_ids = rownames(DE_results), annotation_db = org.Sc.sgd.db, look_for = "ENSEMBL", fetch = "GENENAME")
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+
+```
+
+**1.B- You can compare any pair of factors within any column (varible) providing to the contrast parameter in the results/lfcShrink functions the following vector:**
+
+c("column_name", "factor_1", "factor_2")
+
+Where factor_2 will work as the reference (denominator in the LogFC). This example gives you exactly the same result as example 1.A above.
+
+```{r, warning=FALSE}
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- "example_1.B"
+
+coef = c("treatment","alpha_factor","none")
+
+# Get DESeq2 results. Note that for pairwise comparisons using column and factor names,the coef vector is used as a vector and NOT transformed to a list as in the example 1.A.
+DE_results <- results(dds, contrast=c(coef))
+
+# Shrink Log2FC of genes with low expression
+DE_results <- lfcShrink(dds, 
+                       contrast = c(coef_id),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Add gene names to results table
+DE_results$gene_names <- get_gene_names_from_gene_ids(ensemble_ids = rownames(DE_results), annotation_db = org.Sc.sgd.db, look_for = "ENSEMBL", fetch = "GENENAME")
+
+# Save results table into a file
+write.table(x = as.data.frame(DE_results), 
+            file = "./Results/DE_treatment.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+
+```
+
+### Incorporating interactions between treatment and genotype in the DESeq analysis
+
+The interaction term in the "design" formula always contains two variable (column) names separated by ":", where the variable on the right is the main effect: design = \~ genotype + treatment + **genotype:treatment**
+
+Let's copy the dds object and add the interaction term to the design:
+
+```{r}
+dds_inter <- dds
+
+# Add new formula using combiend column as main effect
+design(dds_inter) <- ~ genotype + treatment + genotype:treatment
+
+# Make sure reference groups are "none" and "wt". This means those categories will be the denominator when calculating Log2FC.
+dds_inter$treatment <- relevel(dds_inter$treatment, "none")
+dds_inter$genotype <- relevel(dds_inter$genotype, "wt")
+
+# Recalculate stats for dds_comb with new formula
+dds_inter <- DESeq(dds_inter)
+
+resultsNames(dds_inter)
+```
+
+Now the coefficients available are: [1] "Intercept"\
+[2] "genotype_kar4_vs_wt"\
+[3] "genotype_ste12_vs_wt"\
+[4] "treatment_alpha_factor_vs_none"\
+[5] "genotypekar4.treatmentalpha_factor" [6] "genotypeste12.treatmentalpha_factor"
+
+Because we are considering interactions, now the main effect "treatment_alpha_factor_vs_none" represents ONLY the differential expression of the reference genotype "wt" across treatments (with treatment="none" as denominator/reference). Hence, For the other two genotypes, the differential epression across treatments will be the main effect + the corresponding interaction coefficient. For any given gene, the interaction term represents the following difference:
+
+genotypeMut.treatmenttreatX = (Mut_treatX - Mut_none) - (WT_treatX - WT_none)
+
+Where: \* genotypeMut.treatmenttreatX: interaction coefficient \* (Mut_treatX - Mut_none): difference in expression between treatments treatX and none a given gene inthe mutant Mut \* (WT_treatX - WT_none): difference in expression between treatments treatX and none a given gene in the WT
+
+Now we can run more sophisticated comparisons. Here are some examples:
+
+**2.A- The effect of treatment on wt genotype (the main effect).**
+
+For this comparison, we can use the "treatment_alpha_factor_vs_none" coefficient. Note that the comparison below won't care about what is going on on the other genotypes.
+
+```{r}
+
+coef = c("treatment_alpha_factor_vs_none")
+
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- c("example_2.A")
+  
+# Get DESeq2 results
+DE_results <- results(dds_inter, contrast = list(c(coef)))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_inter, 
+                       contrast = c(coef),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+```
+
+**2.B- We can run exactly the same comparison above using pairwise comparisons bettween any given two factors.** 
+
+In this case, because we want to consider both vairables simultaneously (treatment + genotype) we will generate an additional column in the metadata table within the DESeq object by concatenating the factors in the treatment and genotype columns. Note that in this case we don't need the interaction term because now each new factor includes both variables.
+
+```{r}
+# Copy DESeq object into a new object
+dds_comb <- dds
+
+# Add combined column to DESeq object
+dds_comb@colData$combined <- as.factor(paste0(metadata$treatment,'_',metadata$genotype))
+
+# Add new formula using combiend column as main effect
+design(dds_comb) <- ~ combined
+
+# Recalculate stats for dds_comb with new formula
+dds_comb <- DESeq(dds_comb)
+
+# Calculate the effect of treatment on wt genotype (the main effect) but with the combined column.
+
+coef = c("combined","alpha_factor_wt","none_wt")
+
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- "example_2.B"
+  
+# Get DESeq2 results
+DE_results <- results(dds_comb, contrast = c(coef))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_comb, 
+                       contrast = c(coef),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]],N=5)
+
+```
+
+**3- Using interactions, the effect of treatment (the main effect) on kar4 genotype.**
+
+This is equal to the effect of treatment on the wt genotype (the main effect) + the genotype-treatment interaction effect in kar4.
+
+```{r, warning=FALSE}
+
+coef = c("treatment_alpha_factor_vs_none","genotypekar4.treatmentalpha_factor")
+
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- "example_3"
+  
+# Get DESeq2 results
+DE_results <- results(dds_inter, contrast = list(c(coef)))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_inter, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]])
+
+```
+
+**4- Using interactions, the effect of treatment on ste12 genotype.** 
+
+This is equal to the effect of treatment on the wt genotype (the main effect) + the genotype-treatment interaction effect in ste12.
+
+```{r, warning=FALSE}
+
+coef = c("treatment_alpha_factor_vs_none","genotypeste12.treatmentalpha_factor")
+
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- "example_4"
+  
+  
+# Get DESeq2 results
+DE_results <- results(dds_inter, contrast = list(c(coef)))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_inter, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]],N=5)
+
+```
+
+**5- Using interactions, difference in gene expression between genotypes kar4 and ste12 when treated with alpha factor**
+
+The coefficient combination here is more complex because there is no specific coeff for this comparison (see below). Therefore, we will need to use the following combination of coefficients:
+
+*genotype_ste12_vs_wt - genotype_kar4_vs_wt + genotypeste12.treatmentalpha_factor - genotypekar4.treatmentalpha_factor*
+
+To pass this formula to DESeq we will use a numeric vector to indicate which coeff are possitive (1), negative (-1) or are not present in the above formula (0), taking advantage that coefficients are organized as a chr vector in the DESeq object:
+
+\> resultsNames(dds)
+
+[1] "Intercept"
+
+[2] "genotype_kar4_vs_wt"
+
+[3] "genotype_ste12_vs_wt"
+
+[4] "treatment_alpha_factor_vs_none"
+
+[5] "genotypekar4.treatmentalpha_factor"
+
+[6] "genotypeste12.treatmentalpha_factor"
+
+The corresponding numeric verctor would be: \> numeric_vector \<- c(0,-1,1,0,-1,1)
+
+For this comparison, we will pass the numeric vector to the results function instead of the actual coefficient names.
+
+For additional information see this [website](https://rstudio-pubs-static.s3.amazonaws.com/329027_593046fb6d7a427da6b2c538caf601e1.html#example-5-three-conditions-three-genotypes-with-interaction-terms)
+
+```{r, warning=FALSE}
+# Set coef_id with the DESeq2 coeficient of interest
+
+coef <- c(0,-1,1,0,-1,1)
+
+coef_id <- "alpha_factor_ste12_vs_kar4"
+
+# Get DESeq2 results
+DE_results <- results(dds_inter, contrast = c(coef))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_inter, 
+                       contrast = c(coef),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+```
+
+**6.A- Diff in gene expression between genotypes kar4 and ste12 with no treatment**
+
+In this case, we don't need to include the interaction terms as above because we are comparing within the reference treatment "none", so basically we compare between genotypes:
+
+*genotype_ste12_vs_wt - genotype_kar4_vs_wt*
+
+\> resultsNames(dds)
+
+[1] "Intercept"
+
+[2] "genotype_kar4_vs_wt"
+
+[3] "genotype_ste12_vs_wt"
+
+[4] "treatment_alpha_factor_vs_none"
+
+[5] "genotypekar4.treatmentalpha_factor"
+
+[6] "genotypeste12.treatmentalpha_factor"
+
+The corresponding numeric verctor would be: \> numeric_vector \<- c(0,-1,1,0,0,0)
+
+```{r, warning=FALSE}
+# Set coef_id with the DESeq2 coeficient of interest
+
+coef <- c(0,-1,1,0,0,0)
+
+coef_id <- "example_6.A"
+
+# Get DESeq2 results
+DE_results <- results(dds_inter, contrast = c(coef))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_inter, 
+                       contrast = c(coef),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+```
+
+**6.B- We can do the same comparison as in example 6.A using pairwise contrasts with the "combined" column**
+
+```{r}
+coef = c("combined","none_ste12","none_kar4")
+
+# Set coef_id with the DESeq2 coeficient of interest
+coef_id <- "example_6.B"
+  
+# Get DESeq2 results
+DE_results <- results(dds_comb, contrast = c(coef))
+
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds_comb, 
+                       contrast = c(coef),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=5)
+
+```
+
+### Save tables with results stored in the DE_results_list object
+
+```{r}
+for (example_name in names(DE_results_list)){
+  # Save results table into a file
+  write.table(x = as.data.frame(DE_results_list[[example_name]]), 
+            file = paste0("./Results/DE_",example_name,".txt"),
+            sep = "\t", 
+            col.names = NA)
+}
+```
+
